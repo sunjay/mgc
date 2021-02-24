@@ -2,6 +2,13 @@
 name = "mgc"
 version = "0.0.0"
 authors = ["Sunjay Varma <varma.sunjay@gmail.com>"]
+description = "The manual garbage collector for when you have complete control"
+repository = "https://github.com/sunjay/mgc"
+readme = "README.md"
+keywords = ["gc", "garbage", "collector", "manual", "interpreter"]
+# crates.io/category_slugs
+categories = ["compilers", "data-structures"]
+license = "MPL-2.0"
 edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
