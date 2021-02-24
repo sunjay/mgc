@@ -8,9 +8,13 @@ name: CI
 
 jobs:
   ci:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+          - macos-latest
         rust:
           - stable
           - beta
@@ -54,7 +58,7 @@ jobs:
           RUSTFLAGS: -D warnings
 
       - name: install miri
-        if: ${{ matrix.rust == 'nightly' }}
+        if: ${{ matrix.rust == 'nightly' && matrix.os == 'ubuntu-latest' }}
         uses: actions-rs/toolchain@v1
         with:
           profile: minimal
@@ -63,7 +67,7 @@ jobs:
           override: true
 
       - name: miri
-        if: ${{ matrix.rust == 'nightly' }}
+        if: ${{ matrix.rust == 'nightly' && matrix.os == 'ubuntu-latest' }}
         uses: actions-rs/cargo@v1
         with:
           command: miri
