@@ -1,13 +1,20 @@
 mod trace;
 mod alloc;
+mod gc;
+mod state;
 
 pub use trace::*;
-pub use alloc::{sweep, needs_collect};
+pub use alloc::*;
+pub use gc::*;
 
-use std::fmt;
 use std::iter;
 use std::ptr::NonNull;
-use std::ops::Deref;
+use std::alloc::handle_alloc_error;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use parking_lot::{Mutex, const_mutex};
+
+use state::InnerState;
 
 #[doc(hidden)] // Not part of the public API of this crate, but needed in all modules
 #[macro_export]
@@ -18,206 +25,110 @@ macro_rules! gc_debug {
     }};
 }
 
-/// Mark the given GC allocated value as still reachable. This will result in the allocation NOT
-/// being collected during the next sweep. Any allocation that is not marked will be freed.
-///
-/// Returns true if the value was already marked previously.
-///
-/// # Safety
-///
-/// This function should not be called concurrently with `sweep`.
-pub fn mark<T: ?Sized>(value: &Gc<T>) -> bool {
-    // Safety: All Gc<T> values are allocated by `alloc` so this pointer should be valid
-    unsafe { alloc::mark(value.ptr) }
+static GLOBAL_GC: GcState<GlobalAlloc> = GcState::with_global();
+
+pub struct GcState<A: Alloc = GlobalAlloc> {
+    alloc: A,
+    inner: Mutex<InnerState>,
+    /// true if the threshold has been reached for the next collection
+    needs_collect: AtomicBool,
 }
 
-/// A cloneable pointer into memory managed by the GC
-///
-/// The value will be freed at some point after the pointer is no longer being used
-///
-/// # Safety
-///
-/// Note that this value is only safe to use as long as the GC has not collected it. It is
-/// unfortunately not possible to statically guarantee that this has not occurred. The user of this
-/// type needs to ensure that the GC is always aware that this value is still being used.
-pub struct Gc<T: ?Sized> {
-    ptr: NonNull<T>,
-}
-
-unsafe impl<T: ?Sized + Sync + Send> Send for Gc<T> {}
-unsafe impl<T: ?Sized + Sync + Send> Sync for Gc<T> {}
-
-impl<T: Trace> Gc<T> {
-    /// Allocates memory managed by the GC and initializes it with the given value
-    #[inline]
-    pub fn new(value: T) -> Self {
+impl GcState<GlobalAlloc> {
+    pub(crate) const fn with_global() -> Self {
         Self {
-            ptr: alloc::allocate(value),
+            alloc: GlobalAlloc::new(),
+            inner: const_mutex(InnerState::new()),
+            needs_collect: AtomicBool::new(false),
         }
     }
 }
 
-impl<T: ?Sized> Gc<T> {
-    /// Returns `true` if the two `Gc` values point to the same allocation
-    /// (in a vein similar to [`ptr::eq`]).
+impl<A: Alloc + Default> GcState<A> {
+    pub fn new() -> Self {
+        Self::with_alloc(Default::default())
+    }
+}
+
+impl<A: Alloc> GcState<A> {
+    pub fn with_alloc(alloc: A) -> Self {
+        Self {
+            alloc,
+            inner: const_mutex(InnerState::new()),
+            needs_collect: AtomicBool::new(false),
+        }
+    }
+
+    /// Returns true if `sweep` should be called as soon as possible
+    pub fn needs_collect(&self) -> bool {
+        self.needs_collect.load(Ordering::Relaxed)
+    }
+
+    /// Allocates memory managed by the GC and initializes it to the given value
     ///
-    /// [`ptr::eq`]: core::ptr::eq
-    pub fn ptr_eq(this: &Self, other: &Self) -> bool {
-        this.ptr.as_ptr() == other.ptr.as_ptr()
+    /// Returns a GC pointer to the value or aborts on memory allocation failure
+    pub fn alloc<T: Trace>(&self, value: T) -> Gc<T> {
+        // Allocate the value as an array of one value
+        let ptr = self.alloc_array_ptr(iter::once(value)).cast();
+        // Safety: Pointer is coming from our internal allocation function, so it is definitely
+        // valid for the `Gc` type
+        unsafe { Gc::from_raw(ptr) }
     }
-}
 
-impl<T: Trace> iter::FromIterator<T> for Gc<[T]> {
-    fn from_iter<I: iter::IntoIterator<Item = T>>(iter: I) -> Self {
-        let items: Vec<T> = Vec::from_iter(iter);
-        items.into()
+    /// Attempts to allocate memory managed by the GC and initialize it to the given value
+    ///
+    /// Returns a GC pointer to the value or an error if the allocation failed
+    pub fn try_alloc<T: Trace>(&self, value: T) -> Result<Gc<T>, AllocError> {
+        // Allocate the value as an array of one value
+        let ptr = self.try_alloc_array_ptr(iter::once(value))?.cast();
+        // Safety: Pointer is coming from our internal allocation function, so it is definitely
+        // valid for the `Gc` type
+        Ok(unsafe { Gc::from_raw(ptr) })
     }
-}
 
-impl<T: Trace> From<T> for Gc<T> {
-    fn from(value: T) -> Self {
-        Self::new(value)
+    /// Allocates memory managed by the GC and initializes it to the given values
+    ///
+    /// Returns a GC pointer to the values or aborts on memory allocation failure
+    pub fn alloc_array<T, I>(&self, values: I) -> Gc<[T]>
+        where T: Trace,
+              I: ExactSizeIterator<Item=T>,
+    {
+        let ptr = self.alloc_array_ptr(values);
+        // Safety: Pointer is coming from our internal allocation function, so it is definitely
+        // valid for the `Gc` type
+        unsafe { Gc::from_raw(ptr) }
     }
-}
 
-impl<'a, T: Trace + Clone> From<&'a [T]> for Gc<[T]> {
-    #[inline]
-    fn from(slice: &'a [T]) -> Self {
-        Self {
-            ptr: alloc::allocate_array(slice.iter().cloned()),
-        }
+    /// Attempts to allocate memory managed by the GC and initialize it to the given values
+    ///
+    /// Returns a GC pointer to the values or an error if the allocation failed
+    pub fn try_alloc_array<T, I>(&self, values: I) -> Result<Gc<[T]>, AllocError>
+        where T: Trace,
+              I: ExactSizeIterator<Item=T>,
+    {
+        let ptr = self.try_alloc_array_ptr(values)?;
+        // Safety: Pointer is coming from our internal allocation function, so it is definitely
+        // valid for the `Gc` type
+        Ok(unsafe { Gc::from_raw(ptr) })
     }
-}
 
-impl<T: Trace> From<Vec<T>> for Gc<[T]> {
-    #[inline]
-    fn from(items: Vec<T>) -> Self {
-        Self {
-            ptr: alloc::allocate_array(items.into_iter()),
-        }
+    pub fn alloc_array_ptr<T, I>(&self, values: I) -> NonNull<[T]>
+        where T: Trace,
+              I: ExactSizeIterator<Item=T>,
+    {
+        self.try_alloc_array_ptr(values)
+            .unwrap_or_else(|err| handle_alloc_error(err.into_inner()))
     }
-}
 
-// This code is pretty much the same as the impl for Arc<str>
-impl From<&str> for Gc<str> {
-    #[inline]
-    fn from(value: &str) -> Self {
-        let Gc {ptr} = Gc::<[u8]>::from(value.as_bytes());
-        let ptr = unsafe { NonNull::new_unchecked(ptr.as_ptr() as *mut str) };
-
-        Self {ptr}
+    pub fn try_alloc_array_ptr<T, I>(&self, values: I) -> Result<NonNull<[T]>, AllocError>
+        where T: Trace,
+              I: ExactSizeIterator<Item=T>,
+    {
+        todo!()
     }
-}
 
-// This code is pretty much the same as the impl for Arc<str>
-impl From<String> for Gc<str> {
-    #[inline]
-    fn from(value: String) -> Self {
-        Gc::from(&value[..])
-    }
-}
-
-impl From<&std::sync::Arc<str>> for Gc<str> {
-    #[inline]
-    fn from(value: &std::sync::Arc<str>) -> Self {
-        (&**value).into()
-    }
-}
-
-impl From<std::sync::Arc<str>> for Gc<str> {
-    #[inline]
-    fn from(value: std::sync::Arc<str>) -> Self {
-        (&*value).into()
-    }
-}
-
-impl<T: ?Sized + Trace> Trace for Gc<T> {
-    fn trace(&self) {
-        // Avoid reference cycles by only tracing values that weren't previously marked
-        if !mark(self) {
-            (**self).trace();
-        }
-    }
-}
-
-impl<T: ?Sized> Deref for Gc<T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        // Safety: The garbage collector should not collect a pointer while it still exists
-        unsafe { self.ptr.as_ref() }
-    }
-}
-
-impl<T: ?Sized> Clone for Gc<T> {
-    fn clone(&self) -> Self {
-        Self {
-            ptr: self.ptr,
-        }
-    }
-}
-
-impl<T: Trace + Default> Default for Gc<T> {
-    fn default() -> Self {
-        Self::new(T::default())
-    }
-}
-
-impl<T: ?Sized + fmt::Debug> fmt::Debug for Gc<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Debug::fmt(&**self, f)
-    }
-}
-
-impl<T: ?Sized + fmt::Display> fmt::Display for Gc<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Display::fmt(&**self, f)
-    }
-}
-
-impl<T: ?Sized> fmt::Pointer for Gc<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        fmt::Pointer::fmt(&self.ptr, f)
-    }
-}
-
-impl<T: ?Sized + PartialEq> PartialEq for Gc<T> {
-    fn eq(&self, other: &Self) -> bool {
-        Self::ptr_eq(self, other) || (**self).eq(&**other)
-    }
-}
-
-impl<T: ?Sized + Eq> Eq for Gc<T> {}
-
-impl<T: ?Sized + PartialOrd> PartialOrd for Gc<T> {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        (**self).partial_cmp(&**other)
-    }
-}
-
-impl<T: ?Sized + Ord> Ord for Gc<T> {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        (**self).cmp(&**other)
-    }
-}
-
-impl<T: ?Sized + std::borrow::Borrow<T>> std::borrow::Borrow<T> for Gc<T> {
-    fn borrow(&self) -> &T {
-        &**self
-    }
-}
-
-impl<T: ?Sized> AsRef<T> for Gc<T> {
-    fn as_ref(&self) -> &T {
-        &**self
-    }
-}
-
-impl<T: ?Sized> Unpin for Gc<T> {}
-
-impl<T: ?Sized + std::hash::Hash> std::hash::Hash for Gc<T> {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        (**self).hash(state)
+    pub unsafe fn sweep(&self) {
+        todo!()
     }
 }
 
