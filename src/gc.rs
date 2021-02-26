@@ -1,5 +1,4 @@
 use crate::trace::*;
-use crate::alloc::{sweep, needs_collect, Alloc, GlobalAlloc};
 
 use std::fmt;
 use std::iter;
