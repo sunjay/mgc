@@ -38,9 +38,29 @@ impl fmt::Display for AllocError {
 
 impl Error for AllocError {}
 
+/// The `Alloc` trait is an `unsafe` trait for a number of reasons, and implementors must ensure
+/// that they adhere to these contracts:
+///
+/// * It's undefined behavior if allocators unwind. This restriction may be lifted in the future,
+///   but currently a panic from any of these functions may lead to memory unsafety.
+/// * Layout queries and calculations in general must be correct. Callers of this trait are allowed
+///   to rely on the contracts defined on each method, and implementors must ensure such contracts
+///   remain true.
 pub unsafe trait Alloc: private::Sealed {
+    /// Allocate memory as described by the given layout
+    ///
+    /// Returns a pointer to newly-allocated memory, or an error to indicate allocation failure.
+    ///
+    /// # Safety
+    ///
+    /// See: [`GlobalAlloc::alloc`](https://doc.rust-lang.org/std/alloc/trait.GlobalAlloc.html#tymethod.alloc)
     unsafe fn alloc(&self, layout: Layout) -> Result<NonNull<u8>, AllocError>;
 
+    /// Deallocate the block of memory at the given `ptr` pointer with the given layout
+    ///
+    /// # Safety
+    ///
+    /// See: [`GlobalAlloc::dealloc`](https://doc.rust-lang.org/std/alloc/trait.GlobalAlloc.html#tymethod.dealloc)
     unsafe fn dealloc(&self, ptr: NonNull<u8>, layout: Layout);
 }
 
@@ -62,10 +82,10 @@ impl private::Sealed for GlobalAlloc {}
 
 unsafe impl Alloc for GlobalAlloc {
     unsafe fn alloc(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
-        todo!()
+        NonNull::new(std::alloc::alloc(layout)).ok_or_else(|| AllocError(layout))
     }
 
     unsafe fn dealloc(&self, ptr: NonNull<u8>, layout: Layout) {
-        todo!()
+        std::alloc::dealloc(ptr.as_ptr(), layout)
     }
 }
