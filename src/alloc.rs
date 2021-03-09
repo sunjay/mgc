@@ -82,7 +82,7 @@ impl private::Sealed for GlobalAlloc {}
 
 unsafe impl Allocator for GlobalAlloc {
     unsafe fn alloc(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
-        NonNull::new(std::alloc::alloc(layout)).ok_or_else(|| AllocError(layout))
+        NonNull::new(std::alloc::alloc(layout)).ok_or(AllocError(layout))
     }
 
     unsafe fn dealloc(&self, ptr: NonNull<u8>, layout: Layout) {
