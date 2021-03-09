@@ -8,6 +8,7 @@ pub use gc::*;
 
 use std::iter;
 use std::mem;
+use std::cmp::max;
 use std::ptr::{self, NonNull};
 use std::alloc::{Layout, handle_alloc_error};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,7 +24,7 @@ macro_rules! gc_debug {
     }};
 }
 
-static GLOBAL_GC: GcState = GcState::with_global();
+static GLOBAL_GC: GcState = GcState::new();
 
 /// An arbitrary value. The goal is to make it so that as the amount of memory the program uses
 /// grows, the threshold moves farther out to limit the total time spent re-traversing the larger
@@ -37,7 +38,7 @@ const GC_DEFAULT_THRESHOLD: usize = 1024 * 1024; // bytes
 #[derive(Debug)]
 struct InnerState {
     /// A linked list of allocations managed by the GC
-    alloc_list: *mut GcHeader,
+    alloc_list: Option<NonNull<GcHeader>>,
     /// The number of bytes needed to trigger a collection
     threshold: usize,
     /// The number of bytes currently allocated
@@ -56,7 +57,7 @@ impl Default for InnerState {
 impl InnerState {
     const fn new() -> Self {
         Self {
-            alloc_list: ptr::null_mut(),
+            alloc_list: None,
             threshold: GC_DEFAULT_THRESHOLD,
             // Nothing has been allocated yet
             allocated: 0,
@@ -141,33 +142,27 @@ unsafe fn mark<T: ?Sized>(ptr: NonNull<T>) -> bool {
 }
 
 pub struct GcState<A: Alloc = GlobalAlloc> {
-    alloc: A,
+    allocator: A,
     inner: Mutex<InnerState>,
     /// true if the threshold has been reached for the next collection
     needs_collect: AtomicBool,
 }
 
 impl GcState {
-    pub(crate) const fn with_global() -> Self {
+    pub(crate) const fn new() -> Self {
         Self {
-            alloc: GlobalAlloc::new(),
+            allocator: GlobalAlloc::new(),
             inner: const_mutex(InnerState::new()),
             needs_collect: AtomicBool::new(false),
         }
     }
 }
 
-impl<A: Alloc + Default> GcState<A> {
-    pub fn new() -> Self {
-        Self::with_alloc(Default::default())
-    }
-}
-
 impl<A: Alloc> GcState<A> {
     /// Creates a new `GcState` with the given allocator
-    pub fn with_alloc(alloc: A) -> Self {
+    pub fn with_alloc(allocator: A) -> Self {
         Self {
-            alloc,
+            allocator,
             inner: const_mutex(InnerState::new()),
             needs_collect: AtomicBool::new(false),
         }
@@ -256,11 +251,7 @@ impl<A: Alloc> GcState<A> {
 
         // Allocate the `GcEntry<[T]>`
         // Safety: Due to the header, the layout passed to `alloc` cannot be zero-sized
-        let entry_ptr = unsafe { alloc(layout) };
-        // Check for allocation failure
-        if entry_ptr.is_null() {
-            handle_alloc_error(layout);
-        }
+        let entry_ptr = unsafe { self.allocator.alloc(layout)? };
 
         // Extract the vtable only if we have at least one element and that element needs to be dropped
         let mut values = values.peekable();
@@ -274,13 +265,13 @@ impl<A: Alloc> GcState<A> {
         // Initialize the header (`header` field of `GcEntry<[T]>`)
         // Safety: #[repr(C)] guarantees that a pointer to `GcEntry` is the same as a pointer to
         // `GcHeader` (since `header` is the first field)
-        let header_ptr = entry_ptr as *mut GcHeader;
+        let header_ptr: NonNull<GcHeader> = entry_ptr.cast();
         let header = GcHeader::array::<T>(len, vtable, layout);
-        unsafe { header_ptr.write(header); }
+        unsafe { header_ptr.as_ptr().write(header); }
 
         // Initialize the array (`value` field of `GcEntry<[T]>`)
         // Safety: Any offsets we take here must match the layouts used to allocate above
-        let array = unsafe { entry_ptr.add(array_start_bytes) } as *mut T;
+        let array = unsafe { entry_ptr.as_ptr().add(array_start_bytes) } as *mut T;
         for (i, value) in values.enumerate() {
             // Safety: We just allocated and checked `entry_ptr`, so this should work
             unsafe { array.add(i).write(value); }
@@ -294,23 +285,23 @@ impl<A: Alloc> GcState<A> {
         //
         // Note that this critical section is kept as small as possible to allow allocation and
         // initialiation to occur in parallel as much as possible
-        let mut gc_state = GC_STATE.lock();
+        let mut gc_state = self.inner.lock();
         let next = gc_state.alloc_list;
-        gc_state.alloc_list = header_ptr;
+        gc_state.alloc_list = Some(header_ptr);
         // Safety: The header was initialized above, so it should still be valid to assign to
-        unsafe { (*header_ptr).next = next; }
+        unsafe { (*header_ptr.as_ptr()).next = next; }
 
         // Record the amount of memory that was allocated
         gc_state.allocated += layout.size();
         if gc_state.allocated > gc_state.threshold {
             // Notify that a collection should take place ASAP
-            NEEDS_COLLECT.store(true, Ordering::SeqCst);
+            self.needs_collect.store(true, Ordering::Relaxed);
         }
 
         gc_debug!("{:p} allocate - size: {} bytes, type: {}, len: {}", value_ptr, array_layout.size(),
             std::any::type_name::<T>(), len);
 
-        value_ptr
+        Ok(value_ptr)
     }
 
     /// Frees the memory associated with the given allocation
@@ -321,7 +312,7 @@ impl<A: Alloc> GcState<A> {
     /// # Safety
     ///
     /// This function may only be used with pointers from the allocation list in `GC_STATE`.
-    unsafe fn free(&self, ptr: NonNull<GcHeader>) -> (usize, *mut GcHeader) {
+    unsafe fn free(&self, ptr: NonNull<GcHeader>) -> (usize, Option<NonNull<GcHeader>>) {
         // Extract info from the header
         // Safety: The pointer should be valid because it is currently in the allocation list. Note that
         // in order to avoid aliasing issues we are careful to copy the values out (avoids references).
@@ -330,7 +321,7 @@ impl<A: Alloc> GcState<A> {
         gc_debug!("{:p} free - size: {} bytes, len: {}", ptr.as_ptr().add(1), size, len);
 
         // Only drop if a vtable was provided for that
-        if !vtable.is_null() {
+        if let Some(vtable) = vtable {
             // Free each item in the array by constructing a trait object for each item and calling
             // `drop_in_place`
 
@@ -340,13 +331,16 @@ impl<A: Alloc> GcState<A> {
 
             for i in 0..len {
                 let data = array.add(i*size) as *mut ();
-                let obj: &mut dyn Trace = mem::transmute(TraitObject {data, vtable});
+                let obj: &mut dyn Trace = mem::transmute(TraitObject {
+                    data,
+                    vtable: vtable.as_ptr(),
+                });
                 ptr::drop_in_place(obj);
             }
         }
 
         // Free the memory
-        dealloc(ptr.as_ptr() as *mut u8, layout);
+        self.allocator.dealloc(ptr.cast(), layout);
 
         (layout.size(), next)
     }
@@ -357,18 +351,21 @@ impl<A: Alloc> GcState<A> {
     ///
     /// This function pauses all other GC functions while it is running. No calls to `trace` should
     /// take place while this is running.
-    pub unsafe fn sweep(&self) {
+    pub fn sweep(&self) {
         // Keep the GC state locked so no allocations can be registered while this takes place
-        let mut gc_state = GC_STATE.lock();
+        let mut gc_state = self.inner.lock();
 
         gc_debug!("sweep start: {} bytes allocated", gc_state.allocated);
 
         // Register ASAP that we are currently collecting so no other thread starts a `sweep`
-        NEEDS_COLLECT.store(false, Ordering::SeqCst);
+        if !self.needs_collect.swap(false, Ordering::Relaxed) {
+            // Some other thread already completed a sweep, so no need to do it again
+            return;
+        }
 
         let mut prev = None;
         let mut current = gc_state.alloc_list;
-        while let Some(mut header) = NonNull::new(current) {
+        while let Some(mut header) = current {
             // We need to be careful to keep the lifetime of &GcHeader short so we don't break the
             // aliasing rules when `free` takes ownership of the data.
             let is_reachable = {
@@ -392,7 +389,7 @@ impl<A: Alloc> GcState<A> {
             }
 
             // Safety: All the pointers we are going through are from `alloc_list`.
-            let (bytes_freed, next) = unsafe { free(header) };
+            let (bytes_freed, next) = unsafe { self.free(header) };
             gc_state.allocated -= bytes_freed;
 
             // Remove the freed allocation from the linked list
@@ -443,18 +440,15 @@ mod tests {
 
     use std::sync::{Arc, atomic::{AtomicU8, Ordering}};
 
-    /// This is used to allow GC tests to pretend they are the only thing using the GC at any given time
-    static GC_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::const_mutex(());
-
     #[test]
     fn gc_alloc() {
-        let _lock = GC_TEST_LOCK.lock();
+        let gc_state = GcState::new();
 
-        let value1 = Gc::new(2i8);
-        let value2 = Gc::new(42i16);
-        let value3 = Gc::new(-33i32);
-        let value4 = Gc::new(54i64);
-        let value5 = Gc::new(-12931i128);
+        let value1 = gc_state.alloc(2i8);
+        let value2 = gc_state.alloc(42i16);
+        let value3 = gc_state.alloc(-33i32);
+        let value4 = gc_state.alloc(54i64);
+        let value5 = gc_state.alloc(-12931i128);
 
         // Check that all the values are as we expect
         assert_eq!(*value1, 2);
@@ -463,35 +457,35 @@ mod tests {
         assert_eq!(*value4, 54);
         assert_eq!(*value5, -12931);
 
-        // Make sure we don't free mgc::marked pointers
-        mark(&value2);
-        mark(&value3);
+        // Make sure we don't free pointers that have been traced
+        value2.trace();
+        value3.trace();
 
-        sweep();
+        gc_state.sweep();
 
         assert_eq!(*value2, 42);
         assert_eq!(*value3, -33);
 
         // Should clean up all memory at the end
-        sweep();
+        gc_state.sweep();
     }
 
     #[test]
     fn gc_str() {
-        let _lock = GC_TEST_LOCK.lock();
+        let gc_state = GcState::new();
 
-        let value = Gc::from("abc123 woooo");
+        let value = gc_state.alloc("abc123 woooo");
         assert_eq!(&*value, "abc123 woooo");
 
         // Should not clean up anything because we've traced
         value.trace();
-        sweep();
+        gc_state.sweep();
 
         // Value should still be the same
         assert_eq!(&*value, "abc123 woooo");
 
         // Should clean up all memory at the end
-        sweep();
+        gc_state.sweep();
     }
 
     #[test]
@@ -572,7 +566,7 @@ mod tests {
 
         let array1: Gc<[NeedsDrop]> = Gc::from(values1);
 
-        assert_eq!(counter.load(Ordering::SeqCst), 0);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
         assert_eq!(array1.len(), 5);
         for (a, b) in array1.iter().zip(1u8..) {
             assert_eq!(a.value, b);
@@ -583,11 +577,11 @@ mod tests {
 
         // Should not clean up anything
         sweep();
-        assert_eq!(counter.load(Ordering::SeqCst), 0);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
 
         // Should clean up all the memory at the end and call drop
         sweep();
-        assert_eq!(counter.load(Ordering::SeqCst), values1.len() as u8);
+        assert_eq!(counter.load(Ordering::Relaxed), values1.len() as u8);
     }
 
     #[test]
