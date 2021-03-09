@@ -24,8 +24,6 @@ macro_rules! gc_debug {
     }};
 }
 
-static GLOBAL_GC: GcState = GcState::new();
-
 /// An arbitrary value. The goal is to make it so that as the amount of memory the program uses
 /// grows, the threshold moves farther out to limit the total time spent re-traversing the larger
 /// live set. Could be tuned with some real-world programs.
@@ -141,7 +139,7 @@ unsafe fn mark<T: ?Sized>(ptr: NonNull<T>) -> bool {
     prev_reachable
 }
 
-pub struct GcState<A: Alloc = GlobalAlloc> {
+pub struct GcState<A: Allocator = GlobalAlloc> {
     allocator: A,
     inner: Mutex<InnerState>,
     /// true if the threshold has been reached for the next collection
@@ -149,7 +147,7 @@ pub struct GcState<A: Alloc = GlobalAlloc> {
 }
 
 impl GcState {
-    pub(crate) const fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             allocator: GlobalAlloc::new(),
             inner: const_mutex(InnerState::new()),
@@ -158,7 +156,7 @@ impl GcState {
     }
 }
 
-impl<A: Alloc> GcState<A> {
+impl<A: Allocator> GcState<A> {
     /// Creates a new `GcState` with the given allocator
     pub fn with_alloc(allocator: A) -> Self {
         Self {
@@ -171,28 +169,6 @@ impl<A: Alloc> GcState<A> {
     /// Returns true if `sweep` should be called as soon as possible
     pub fn needs_collect(&self) -> bool {
         self.needs_collect.load(Ordering::Relaxed)
-    }
-
-    /// Allocates memory managed by the GC and initializes it to the given value
-    ///
-    /// Returns a GC pointer to the value or aborts on memory allocation failure
-    pub fn alloc<T: Trace>(&self, value: T) -> Gc<T> {
-        // Allocate the value as an array of one value
-        let ptr = self.alloc_array_ptr(iter::once(value)).cast();
-        // Safety: Pointer is coming from our internal allocation function, so it is definitely
-        // valid for the `Gc` type
-        unsafe { Gc::from_raw(ptr) }
-    }
-
-    /// Attempts to allocate memory managed by the GC and initialize it to the given value
-    ///
-    /// Returns a GC pointer to the value or an error if the allocation failed
-    pub fn try_alloc<T: Trace>(&self, value: T) -> Result<Gc<T>, AllocError> {
-        // Allocate the value as an array of one value
-        let ptr = self.try_alloc_array_ptr(iter::once(value))?.cast();
-        // Safety: Pointer is coming from our internal allocation function, so it is definitely
-        // valid for the `Gc` type
-        Ok(unsafe { Gc::from_raw(ptr) })
     }
 
     /// Allocates memory managed by the GC and initializes it to the given values
@@ -414,6 +390,99 @@ impl<A: Alloc> GcState<A> {
     }
 }
 
+pub trait GcStateAlloc<T> {
+    type Output: Trace + ?Sized;
+
+    /// Attempts to allocate memory managed by the GC and initialize it to the given value
+    ///
+    /// Returns a GC pointer to the value or an error if the allocation failed
+    fn try_alloc(&self, value: T) -> Result<Gc<Self::Output>, AllocError>;
+
+    /// Allocates memory managed by the GC and initializes it to the given value
+    ///
+    /// Returns a GC pointer to the value or aborts on memory allocation failure
+    fn alloc(&self, value: T) -> Gc<Self::Output> {
+        self.try_alloc(value)
+            .unwrap_or_else(|err| handle_alloc_error(err.into_inner()))
+    }
+}
+
+impl<T: Trace> GcStateAlloc<T> for GcState {
+    type Output = T;
+
+    fn try_alloc(&self, value: T) -> Result<Gc<Self::Output>, AllocError> {
+        // Allocate the value as an array of one value
+        let ptr = self.try_alloc_array_ptr(iter::once(value))?.cast();
+        // Safety: Pointer is coming from our internal allocation function, so it is definitely
+        // valid for the `Gc` type
+        Ok(unsafe { Gc::from_raw(ptr) })
+    }
+}
+
+impl<'a, T: Trace + Clone> GcStateAlloc<&'a [T]> for GcState {
+    type Output = [T];
+
+    #[inline]
+    fn try_alloc(&self, slice: &'a [T]) -> Result<Gc<Self::Output>, AllocError> {
+        self.try_alloc_array(slice.iter().cloned())
+    }
+}
+
+impl<T: Trace> GcStateAlloc<Vec<T>> for GcState {
+    type Output = [T];
+
+    #[inline]
+    fn try_alloc(&self, items: Vec<T>) -> Result<Gc<Self::Output>, AllocError> {
+        self.try_alloc_array(items.into_iter())
+    }
+}
+
+// This code is similar to the From impl for Arc<str>
+impl GcStateAlloc<&str> for GcState {
+    type Output = str;
+
+    #[inline]
+    fn try_alloc(&self, value: &str) -> Result<Gc<Self::Output>, AllocError> {
+        use std::str;
+
+        let ptr = Gc::into_raw(self.try_alloc(value.as_bytes())?);
+
+        // Safety: Since the bytes came from a valid `str`, we must still be producing a valid `str`.
+        let str_ptr = unsafe { NonNull::new_unchecked(ptr.as_ptr() as *mut str) };
+
+        // Safety: A pointer produced from `Gc::into_raw` is valid for `from_raw`.
+        Ok(unsafe { Gc::from_raw(str_ptr) })
+    }
+}
+
+// This code is similar to the From impl for Arc<str>
+impl GcStateAlloc<String> for GcState {
+    type Output = str;
+
+    #[inline]
+    fn try_alloc(&self, value: String) -> Result<Gc<Self::Output>, AllocError> {
+        self.try_alloc(&value[..])
+    }
+}
+
+impl GcStateAlloc<&std::sync::Arc<str>> for GcState {
+    type Output = str;
+
+    #[inline]
+    fn try_alloc(&self, value: &std::sync::Arc<str>) -> Result<Gc<Self::Output>, AllocError> {
+        self.try_alloc(&**value)
+    }
+}
+
+impl GcStateAlloc<std::sync::Arc<str>> for GcState {
+    type Output = str;
+
+    #[inline]
+    fn try_alloc(&self, value: std::sync::Arc<str>) -> Result<Gc<Self::Output>, AllocError> {
+        self.try_alloc(&*value)
+    }
+}
+
 /// Copied from: https://doc.rust-lang.org/std/raw/struct.TraitObject.html
 //TODO: Will need to be updated in the future when the representation changes.
 //  See: https://github.com/rust-lang/rust/issues/27751
@@ -490,14 +559,14 @@ mod tests {
 
     #[test]
     fn gc_array() {
-        let _lock = GC_TEST_LOCK.lock();
+        let gc_state = GcState::new();
 
         let values1: &[Gc<u16>] = &[
-            Gc::new(2),
-            Gc::new(3),
-            Gc::new(123),
-            Gc::new(70),
-            Gc::new(42),
+            gc_state.alloc(2),
+            gc_state.alloc(3),
+            gc_state.alloc(123),
+            gc_state.alloc(70),
+            gc_state.alloc(42),
         ];
 
         let values2: &[u16] = &[
@@ -509,8 +578,8 @@ mod tests {
         ];
 
         // These type annotations are unnecessary, but good for testing
-        let array1: Gc<[Gc<u16>]> = Gc::from(values1);
-        let array2: Gc<[u16]> = Gc::from(values2);
+        let array1: Gc<[Gc<u16>]> = gc_state.alloc(values1);
+        let array2: Gc<[u16]> = gc_state.alloc(values2);
 
         // Check all values are as we expect
         assert_eq!(array1.len(), array2.len());
@@ -522,7 +591,7 @@ mod tests {
         array2.trace();
 
         // Should not clean up anything
-        sweep();
+        gc_state.sweep();
 
         // Check all values are still as we expect
         assert_eq!(array1.len(), array2.len());
@@ -531,7 +600,7 @@ mod tests {
         }
 
         // Should clean up all memory at the end
-        sweep();
+        gc_state.sweep();
     }
 
     #[derive(Debug, Clone)]
@@ -552,7 +621,7 @@ mod tests {
 
     #[test]
     fn gc_array_drop() {
-        let _lock = GC_TEST_LOCK.lock();
+        let gc_state = GcState::new();
 
         let counter = Arc::new(AtomicU8::new(0));
 
@@ -564,7 +633,7 @@ mod tests {
             NeedsDrop {value: 5, counter: counter.clone()},
         ];
 
-        let array1: Gc<[NeedsDrop]> = Gc::from(values1);
+        let array1: Gc<[NeedsDrop]> = gc_state.alloc(values1);
 
         assert_eq!(counter.load(Ordering::Relaxed), 0);
         assert_eq!(array1.len(), 5);
@@ -573,23 +642,23 @@ mod tests {
         }
 
         // mark the value to prevent it from being collected
-        mark(&array1);
+        array1.trace();
 
         // Should not clean up anything
-        sweep();
+        gc_state.sweep();
         assert_eq!(counter.load(Ordering::Relaxed), 0);
 
         // Should clean up all the memory at the end and call drop
-        sweep();
+        gc_state.sweep();
         assert_eq!(counter.load(Ordering::Relaxed), values1.len() as u8);
     }
 
     #[test]
     fn gc_zero_sized_types() {
-        let _lock = GC_TEST_LOCK.lock();
+        let gc_state = GcState::new();
 
-        let value1 = Gc::new(());
-        let value2 = Gc::from(&[] as &[i32]);
+        let value1 = gc_state.alloc(());
+        let value2 = gc_state.alloc(&[] as &[i32]);
 
         // Should be able to access the value as normal
         assert_eq!(*value1, ());
@@ -598,11 +667,11 @@ mod tests {
         println!("{:?}", &*value2);
 
         // marking the value should work even though it is zero-sized
-        mark(&value1);
-        mark(&value2);
+        value1.trace();
+        value2.trace();
 
         // Should not clean up anything
-        sweep();
+        gc_state.sweep();
 
         // Should be able to access the value as normal
         assert_eq!(*value1, ());
@@ -611,12 +680,12 @@ mod tests {
         println!("{:?}", &*value2);
 
         // Should clean up all the memory at the end
-        sweep();
+        gc_state.sweep();
     }
 
     #[test]
     fn gc_cycles() {
-        let _lock = GC_TEST_LOCK.lock();
+        let gc_state = GcState::new();
 
         // Source: https://doc.rust-lang.org/book/ch15-06-reference-cycles.html
         use parking_lot::Mutex;
@@ -655,8 +724,8 @@ mod tests {
             }
         }
 
-        let a = Gc::new(Cons(5, Mutex::new(Gc::new(Nil))));
-        let b = Gc::new(Cons(10, Mutex::new(Gc::clone(&a))));
+        let a = gc_state.alloc(Cons(5, Mutex::new(gc_state.alloc(Nil))));
+        let b = gc_state.alloc(Cons(10, Mutex::new(Gc::clone(&a))));
         // Create reference cycle
         if let Some(link) = a.tail() {
             *link.lock() = Gc::clone(&b);
@@ -674,13 +743,13 @@ mod tests {
         assert_eq!(b.value(), Some(10));
 
         // Should not clean up anything (since `trace` marks the values)
-        sweep();
+        gc_state.sweep();
 
         // Values should still be the same
         assert_eq!(a.value(), Some(5));
         assert_eq!(b.value(), Some(10));
 
         // Should clean up all the memory at the end
-        sweep();
+        gc_state.sweep();
     }
 }

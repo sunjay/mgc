@@ -38,7 +38,7 @@ impl fmt::Display for AllocError {
 
 impl Error for AllocError {}
 
-/// The `Alloc` trait is an `unsafe` trait for a number of reasons, and implementors must ensure
+/// The `Allocator` trait is an `unsafe` trait for a number of reasons, and implementors must ensure
 /// that they adhere to these contracts:
 ///
 /// * It's undefined behavior if allocators unwind. This restriction may be lifted in the future,
@@ -46,7 +46,7 @@ impl Error for AllocError {}
 /// * Layout queries and calculations in general must be correct. Callers of this trait are allowed
 ///   to rely on the contracts defined on each method, and implementors must ensure such contracts
 ///   remain true.
-pub unsafe trait Alloc: private::Sealed {
+pub unsafe trait Allocator: private::Sealed {
     /// Allocate memory as described by the given layout
     ///
     /// Returns a pointer to newly-allocated memory, or an error to indicate allocation failure.
@@ -80,7 +80,7 @@ impl GlobalAlloc {
 #[doc(hidden)]
 impl private::Sealed for GlobalAlloc {}
 
-unsafe impl Alloc for GlobalAlloc {
+unsafe impl Allocator for GlobalAlloc {
     unsafe fn alloc(&self, layout: Layout) -> Result<NonNull<u8>, AllocError> {
         NonNull::new(std::alloc::alloc(layout)).ok_or_else(|| AllocError(layout))
     }

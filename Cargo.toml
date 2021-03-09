@@ -17,5 +17,10 @@ edition = "2018"
 parking_lot = "0.11"
 
 [features]
+default = ["global"]
+
 # Enable debug logging (has a small performance penalty)
 debug = []
+
+# Enable the global GC and related methods on the `Gc` type
+global = []

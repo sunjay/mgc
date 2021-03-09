@@ -1,9 +1,16 @@
 use crate::trace::*;
 
 use std::fmt;
+#[cfg(feature = "global")]
 use std::iter;
 use std::ptr::NonNull;
 use std::ops::Deref;
+
+#[cfg(feature = "global")]
+use super::{GcState, GcStateAlloc};
+
+#[cfg(feature = "global")]
+static GLOBAL_GC: GcState = GcState::new();
 
 /// Mark the given GC allocated value as still reachable. This will result in the allocation NOT
 /// being collected during the next sweep. Any allocation that is not marked will be freed.
@@ -13,9 +20,9 @@ use std::ops::Deref;
 /// # Safety
 ///
 /// This function should not be called concurrently with `sweep`.
-pub fn mark<T: ?Sized>(value: &Gc<T>) -> bool {
+fn mark<T: ?Sized>(value: &Gc<T>) -> bool {
     // Safety: All Gc<T> values are allocated by `alloc` so this pointer should be valid
-    unsafe { alloc::mark(value.ptr) }
+    unsafe { super::mark(value.ptr) }
 }
 
 /// A cloneable pointer into memory managed by the GC
@@ -34,13 +41,13 @@ pub struct Gc<T: ?Sized> {
 unsafe impl<T: ?Sized + Sync + Send> Send for Gc<T> {}
 unsafe impl<T: ?Sized + Sync + Send> Sync for Gc<T> {}
 
+#[cfg(feature = "global")]
+#[cfg_attr(docsrs, doc(cfg(feature = "global")))]
 impl<T: Trace> Gc<T> {
     /// Allocates memory managed by the GC and initializes it with the given value
     #[inline]
     pub fn new(value: T) -> Self {
-        Self {
-            ptr: alloc::allocate(value),
-        }
+        GLOBAL_GC.alloc(value)
     }
 }
 
@@ -79,6 +86,8 @@ impl<T: ?Sized> Gc<T> {
     }
 }
 
+#[cfg(feature = "global")]
+#[cfg_attr(docsrs, doc(cfg(feature = "global")))]
 impl<T: Trace> iter::FromIterator<T> for Gc<[T]> {
     fn from_iter<I: iter::IntoIterator<Item = T>>(iter: I) -> Self {
         let items: Vec<T> = Vec::from_iter(iter);
@@ -86,60 +95,67 @@ impl<T: Trace> iter::FromIterator<T> for Gc<[T]> {
     }
 }
 
+#[cfg(feature = "global")]
+#[cfg_attr(docsrs, doc(cfg(feature = "global")))]
 impl<T: Trace> From<T> for Gc<T> {
     fn from(value: T) -> Self {
-        Self::new(value)
+        GLOBAL_GC.alloc(value)
     }
 }
 
+#[cfg(feature = "global")]
+#[cfg_attr(docsrs, doc(cfg(feature = "global")))]
 impl<'a, T: Trace + Clone> From<&'a [T]> for Gc<[T]> {
     #[inline]
     fn from(slice: &'a [T]) -> Self {
-        Self {
-            ptr: alloc::allocate_array(slice.iter().cloned()),
-        }
+        GLOBAL_GC.alloc(slice)
     }
 }
 
+#[cfg(feature = "global")]
+#[cfg_attr(docsrs, doc(cfg(feature = "global")))]
 impl<T: Trace> From<Vec<T>> for Gc<[T]> {
     #[inline]
     fn from(items: Vec<T>) -> Self {
-        Self {
-            ptr: alloc::allocate_array(items.into_iter()),
-        }
+        GLOBAL_GC.alloc(items)
     }
 }
 
 // This code is pretty much the same as the impl for Arc<str>
+#[cfg(feature = "global")]
+#[cfg_attr(docsrs, doc(cfg(feature = "global")))]
 impl From<&str> for Gc<str> {
     #[inline]
     fn from(value: &str) -> Self {
-        let Gc {ptr} = Gc::<[u8]>::from(value.as_bytes());
-        let ptr = unsafe { NonNull::new_unchecked(ptr.as_ptr() as *mut str) };
-
-        Self {ptr}
+        GLOBAL_GC.alloc(value)
     }
 }
 
 // This code is pretty much the same as the impl for Arc<str>
+#[cfg(feature = "global")]
+#[cfg_attr(docsrs, doc(cfg(feature = "global")))]
 impl From<String> for Gc<str> {
     #[inline]
     fn from(value: String) -> Self {
-        Gc::from(&value[..])
+        GLOBAL_GC.alloc(value)
     }
 }
 
+#[cfg(feature = "global")]
+#[cfg_attr(docsrs, doc(cfg(feature = "global")))]
 impl From<&std::sync::Arc<str>> for Gc<str> {
     #[inline]
     fn from(value: &std::sync::Arc<str>) -> Self {
-        (&**value).into()
+        GLOBAL_GC.alloc(value)
     }
 }
 
+#[cfg(feature = "global")]
+#[cfg_attr(docsrs, doc(cfg(feature = "global")))]
 impl From<std::sync::Arc<str>> for Gc<str> {
     #[inline]
     fn from(value: std::sync::Arc<str>) -> Self {
-        (&*value).into()
+        GLOBAL_GC.alloc(value)
     }
 }
 
@@ -169,6 +185,7 @@ impl<T: ?Sized> Clone for Gc<T> {
     }
 }
 
+#[cfg(feature = "global")]
 impl<T: Trace + Default> Default for Gc<T> {
     fn default() -> Self {
         Self::new(T::default())
