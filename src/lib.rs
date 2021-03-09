@@ -1,3 +1,5 @@
+#![cfg_attr(docsrs, feature(doc_cfg))]
+
 mod trace;
 mod alloc;
 mod gc;
@@ -485,7 +487,7 @@ impl GcStateAlloc<std::sync::Arc<str>> for GcState {
 //  See: https://github.com/rust-lang/rust/issues/27751
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub struct TraitObject {
+struct TraitObject {
     pub data: *mut (),
     pub vtable: *mut (),
 }
