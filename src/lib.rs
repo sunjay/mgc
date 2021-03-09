@@ -334,10 +334,7 @@ impl<A: Allocator> GcState<A> {
         gc_debug!("sweep start: {} bytes allocated", gc_state.allocated);
 
         // Register ASAP that we are currently collecting so no other thread starts a `sweep`
-        if !self.needs_collect.swap(false, Ordering::Relaxed) {
-            // Some other thread already completed a sweep, so no need to do it again
-            return;
-        }
+        self.needs_collect.store(false, Ordering::Relaxed);
 
         let mut prev = None;
         let mut current = gc_state.alloc_list;
