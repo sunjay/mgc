@@ -2,10 +2,13 @@
 
 mod trace;
 mod alloc;
+#[cfg(feature = "global")]
+mod global;
 mod gc;
 
 pub use trace::*;
 pub use alloc::*;
+pub use global::*;
 pub use gc::*;
 
 use std::iter;
