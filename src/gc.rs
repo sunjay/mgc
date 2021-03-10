@@ -7,7 +7,7 @@ use std::ptr::NonNull;
 use std::ops::Deref;
 
 #[cfg(feature = "global")]
-use super::{GLOBAL_GC, GcStateAlloc};
+use super::{GLOBAL_GC, GcAlloc};
 
 /// Mark the given GC allocated value as still reachable. This will result in the allocation NOT
 /// being collected during the next sweep. Any allocation that is not marked will be freed.

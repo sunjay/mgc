@@ -144,14 +144,14 @@ unsafe fn mark<T: ?Sized>(ptr: NonNull<T>) -> bool {
     prev_reachable
 }
 
-pub struct GcState<A: Allocator = GlobalAlloc> {
+pub struct GcAllocator<A: Allocator = GlobalAlloc> {
     allocator: A,
     inner: Mutex<InnerState>,
     /// true if the threshold has been reached for the next collection
     needs_collect: AtomicBool,
 }
 
-impl GcState {
+impl GcAllocator {
     pub const fn new() -> Self {
         Self {
             allocator: GlobalAlloc::new(),
@@ -161,8 +161,8 @@ impl GcState {
     }
 }
 
-impl<A: Allocator> GcState<A> {
-    /// Creates a new `GcState` with the given allocator
+impl<A: Allocator> GcAllocator<A> {
+    /// Creates a new `GcAllocator` with the given allocator
     pub fn with_alloc(allocator: A) -> Self {
         Self {
             allocator,
@@ -392,7 +392,7 @@ impl<A: Allocator> GcState<A> {
     }
 }
 
-pub trait GcStateAlloc<T> {
+pub trait GcAlloc<T> {
     type Output: Trace + ?Sized;
 
     /// Attempts to allocate memory managed by the GC and initialize it to the given value
@@ -409,7 +409,7 @@ pub trait GcStateAlloc<T> {
     }
 }
 
-impl<T: Trace> GcStateAlloc<T> for GcState {
+impl<T: Trace> GcAlloc<T> for GcAllocator {
     type Output = T;
 
     fn try_alloc(&self, value: T) -> Result<Gc<Self::Output>, AllocError> {
@@ -421,7 +421,7 @@ impl<T: Trace> GcStateAlloc<T> for GcState {
     }
 }
 
-impl<'a, T: Trace + Clone> GcStateAlloc<&'a [T]> for GcState {
+impl<'a, T: Trace + Clone> GcAlloc<&'a [T]> for GcAllocator {
     type Output = [T];
 
     #[inline]
@@ -430,7 +430,7 @@ impl<'a, T: Trace + Clone> GcStateAlloc<&'a [T]> for GcState {
     }
 }
 
-impl<T: Trace> GcStateAlloc<Vec<T>> for GcState {
+impl<T: Trace> GcAlloc<Vec<T>> for GcAllocator {
     type Output = [T];
 
     #[inline]
@@ -440,7 +440,7 @@ impl<T: Trace> GcStateAlloc<Vec<T>> for GcState {
 }
 
 // This code is similar to the From impl for Arc<str>
-impl GcStateAlloc<&str> for GcState {
+impl GcAlloc<&str> for GcAllocator {
     type Output = str;
 
     #[inline]
@@ -458,7 +458,7 @@ impl GcStateAlloc<&str> for GcState {
 }
 
 // This code is similar to the From impl for Arc<str>
-impl GcStateAlloc<String> for GcState {
+impl GcAlloc<String> for GcAllocator {
     type Output = str;
 
     #[inline]
@@ -467,7 +467,7 @@ impl GcStateAlloc<String> for GcState {
     }
 }
 
-impl GcStateAlloc<&std::sync::Arc<str>> for GcState {
+impl GcAlloc<&std::sync::Arc<str>> for GcAllocator {
     type Output = str;
 
     #[inline]
@@ -476,7 +476,7 @@ impl GcStateAlloc<&std::sync::Arc<str>> for GcState {
     }
 }
 
-impl GcStateAlloc<std::sync::Arc<str>> for GcState {
+impl GcAlloc<std::sync::Arc<str>> for GcAllocator {
     type Output = str;
 
     #[inline]
@@ -513,7 +513,7 @@ mod tests {
 
     #[test]
     fn gc_alloc() {
-        let gc_state = GcState::new();
+        let gc_state = GcAllocator::new();
 
         let value1 = gc_state.alloc(2i8);
         let value2 = gc_state.alloc(42i16);
@@ -543,7 +543,7 @@ mod tests {
 
     #[test]
     fn gc_str() {
-        let gc_state = GcState::new();
+        let gc_state = GcAllocator::new();
 
         let value = gc_state.alloc("abc123 woooo");
         assert_eq!(&*value, "abc123 woooo");
@@ -561,7 +561,7 @@ mod tests {
 
     #[test]
     fn gc_array() {
-        let gc_state = GcState::new();
+        let gc_state = GcAllocator::new();
 
         let values1: &[Gc<u16>] = &[
             gc_state.alloc(2),
@@ -623,7 +623,7 @@ mod tests {
 
     #[test]
     fn gc_array_drop() {
-        let gc_state = GcState::new();
+        let gc_state = GcAllocator::new();
 
         let counter = Arc::new(AtomicU8::new(0));
 
@@ -657,7 +657,7 @@ mod tests {
 
     #[test]
     fn gc_zero_sized_types() {
-        let gc_state = GcState::new();
+        let gc_state = GcAllocator::new();
 
         let value1 = gc_state.alloc(());
         let value2 = gc_state.alloc(&[] as &[i32]);
@@ -687,7 +687,7 @@ mod tests {
 
     #[test]
     fn gc_cycles() {
-        let gc_state = GcState::new();
+        let gc_state = GcAllocator::new();
 
         // Source: https://doc.rust-lang.org/book/ch15-06-reference-cycles.html
         use parking_lot::Mutex;
