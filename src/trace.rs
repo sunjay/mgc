@@ -70,6 +70,14 @@ impl<T: Trace> Trace for parking_lot::RwLock<T> {
     }
 }
 
+impl<T: Trace> Trace for Option<T> {
+    fn trace(&self) {
+        if let Some(value) = self {
+            value.trace();
+        }
+    }
+}
+
 macro_rules! impl_trace_tuples {
     ($first:ident $(, $rest:ident)* $(,)?) => {
         impl_trace_tuples!($($rest),*);

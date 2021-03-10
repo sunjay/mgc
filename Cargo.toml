@@ -16,6 +16,9 @@ edition = "2018"
 [dependencies]
 parking_lot = "0.11"
 
+[dev-dependencies]
+rand = "0.8"
+
 [features]
 default = ["global"]
 
